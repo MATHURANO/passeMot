@@ -5,6 +5,8 @@ import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -57,6 +59,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var champMessage: EditText
     private lateinit var boutonDemarrer: Button
     private lateinit var boutonEnvoyer: Button
+    private lateinit var boutonPing: Button
+
+    private val rythme = Handler(Looper.getMainLooper())
+    private var pingActif = false
+    private var numeroPing = 0
 
     // ------------------------------------------------------------------
     // Écran (construit en code pour éviter les fichiers de mise en page)
@@ -97,6 +104,11 @@ class MainActivity : AppCompatActivity() {
 
         champMessage = EditText(this).apply { hint = "Écris un message" }
 
+        boutonPing = Button(this).apply {
+            text = "Test de portée (ping)"
+            setOnClickListener { basculerPing() }
+        }
+
         boutonEnvoyer = Button(this).apply {
             text = "Envoyer"
             isEnabled = false
@@ -106,6 +118,7 @@ class MainActivity : AppCompatActivity() {
         racine.addView(titre)
         racine.addView(statut)
         racine.addView(boutonDemarrer)
+        racine.addView(boutonPing)
         racine.addView(
             defilement,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
@@ -193,12 +206,16 @@ class MainActivity : AppCompatActivity() {
         reseauActif = true
         boutonDemarrer.text = "Arrêter le réseau"
         majStatut()
+        rythme.postDelayed(boucleRecherche, 15000)
     }
 
     private fun arreter() {
         client.stopAdvertising()
         client.stopDiscovery()
         client.stopAllEndpoints()
+        rythme.removeCallbacksAndMessages(null)
+        pingActif = false
+        boutonPing.text = "Test de portée (ping)"
         voisins.clear()
         noms.clear()
         demandesEnCours.clear()
@@ -226,7 +243,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onEndpointLost(id: String) {
-            // rien à faire pour ce premier test
+            demandesEnCours.remove(id)
         }
     }
 
@@ -250,9 +267,12 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onDisconnected(id: String) {
-            ecrire("${voisins[id] ?: id} s'est déconnecté")
+            ecrire("${voisins[id] ?: id} s'est déconnecté (hors de portée ?)")
             voisins.remove(id)
+            noms.remove(id)
+            demandesEnCours.remove(id)
             majStatut()
+            relancerRecherche()
         }
     }
 
@@ -270,6 +290,50 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Relance la recherche : sert à se reconnecter quand on revient à portée
+    private fun relancerRecherche() {
+        if (!reseauActif) return
+        client.stopDiscovery()
+        val options = DiscoveryOptions.Builder().setStrategy(strategie).build()
+        client.startDiscovery(SERVICE_ID, decouverte, options)
+            .addOnFailureListener { ecrire("Erreur (recherche) : ${it.message}") }
+    }
+
+    // Toutes les 15 s, si on n'a aucun voisin, on relance la recherche
+    private val boucleRecherche = object : Runnable {
+        override fun run() {
+            if (!reseauActif) return
+            if (voisins.isEmpty()) relancerRecherche()
+            rythme.postDelayed(this, 15000)
+        }
+    }
+
+    // Test de portée : un "ping" toutes les 2 secondes
+    private val boucleDuPing = object : Runnable {
+        override fun run() {
+            if (!pingActif) return
+            if (voisins.isNotEmpty()) {
+                numeroPing++
+                val texte = "ping #$numeroPing"
+                client.sendPayload(voisins.keys.toList(), Payload.fromBytes(texte.toByteArray(Charsets.UTF_8)))
+            }
+            rythme.postDelayed(this, 2000)
+        }
+    }
+
+    private fun basculerPing() {
+        pingActif = !pingActif
+        if (pingActif) {
+            numeroPing = 0
+            boutonPing.text = "Arrêter le test de portée"
+            ecrire("Test de portée : un ping toutes les 2 s. Éloigne-toi et note où ils s'arrêtent.")
+            rythme.post(boucleDuPing)
+        } else {
+            boutonPing.text = "Test de portée (ping)"
+            rythme.removeCallbacks(boucleDuPing)
+        }
+    }
+
     private fun envoyer() {
         val texte = champMessage.text.toString().trim()
         if (texte.isEmpty() || voisins.isEmpty()) return
@@ -279,6 +343,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        rythme.removeCallbacksAndMessages(null)
         client.stopAdvertising()
         client.stopDiscovery()
         client.stopAllEndpoints()
