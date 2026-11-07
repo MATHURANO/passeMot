@@ -28,30 +28,42 @@ import com.google.android.gms.nearby.connection.Payload
 import com.google.android.gms.nearby.connection.PayloadCallback
 import com.google.android.gms.nearby.connection.PayloadTransferUpdate
 import com.google.android.gms.nearby.connection.Strategy
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
+
+/** Un message gardé en mémoire pour être transmis plus tard (store-and-forward). */
+private class Stocke(val env: JSONObject, val recuLe: Long)
 
 /**
- * Passe-Mot : premier test.
- * Deux téléphones se trouvent sans internet et s'échangent des messages texte.
+ * Passe-Mot v0.3 : relais de messages.
+ * Un message passe de téléphone en téléphone (plusieurs sauts) et reste en mémoire
+ * pour être donné aux prochains téléphones croisés.
  */
 class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val SERVICE_ID = "com.passemot.app.v1"
         private const val CODE_PERMISSIONS = 42
+        private const val TTL_DEPART = 5                           // nombre de sauts autorisés
+        private const val DUREE_MEMOIRE_MS = 2 * 60 * 60 * 1000L   // un message reste 2 h en mémoire
     }
 
-    // P2P_CLUSTER : chaque téléphone peut être connecté à plusieurs voisins (base du maillage)
     private val strategie = Strategy.P2P_CLUSTER
     private val monNom = "Tel-" + (1000..9999).random()
     private lateinit var client: ConnectionsClient
 
-    private val voisins = mutableMapOf<String, String>()   // idVoisin -> nom
-    private val noms = mutableMapOf<String, String>()      // idVoisin -> nom (avant connexion)
+    private val voisins = mutableMapOf<String, String>()           // idVoisin -> nom
+    private val noms = mutableMapOf<String, String>()              // idVoisin -> nom (avant connexion)
     private val demandesEnCours = mutableSetOf<String>()
     private var reseauActif = false
+
+    // --- Relais ---
+    private val vus = mutableSetOf<String>()                       // ids des messages déjà traités (anti-doublon)
+    private val memoire = mutableMapOf<String, Stocke>()           // messages à transmettre
+    private val envoyesA = mutableMapOf<String, MutableSet<String>>() // idVoisin -> ids déjà envoyés
 
     private lateinit var statut: TextView
     private lateinit var journal: TextView
@@ -66,7 +78,7 @@ class MainActivity : AppCompatActivity() {
     private var numeroPing = 0
 
     // ------------------------------------------------------------------
-    // Écran (construit en code pour éviter les fichiers de mise en page)
+    // Écran
     // ------------------------------------------------------------------
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -84,7 +96,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val titre = TextView(this).apply {
-            text = "Passe-Mot (test)"
+            text = "Passe-Mot v0.3 (relais)"
             textSize = 22f
             setTypeface(typeface, Typeface.BOLD)
         }
@@ -99,15 +111,15 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { demarrerOuArreter() }
         }
 
-        journal = TextView(this).apply { textSize = 14f }
-        defilement = ScrollView(this).apply { addView(journal) }
-
-        champMessage = EditText(this).apply { hint = "Écris un message" }
-
         boutonPing = Button(this).apply {
             text = "Test de portée (ping)"
             setOnClickListener { basculerPing() }
         }
+
+        journal = TextView(this).apply { textSize = 14f }
+        defilement = ScrollView(this).apply { addView(journal) }
+
+        champMessage = EditText(this).apply { hint = "Écris un message" }
 
         boutonEnvoyer = Button(this).apply {
             text = "Envoyer"
@@ -138,9 +150,10 @@ class MainActivity : AppCompatActivity() {
         statut.text = if (!reseauActif) {
             "Réseau arrêté"
         } else {
-            "Réseau actif : ${voisins.size} téléphone(s) connecté(s)"
+            "Réseau actif : ${voisins.size} voisin(s), ${memoire.size} message(s) en mémoire"
         }
-        boutonEnvoyer.isEnabled = voisins.isNotEmpty()
+        // On peut écrire même sans voisin : le message attend en mémoire
+        boutonEnvoyer.isEnabled = reseauActif
     }
 
     // ------------------------------------------------------------------
@@ -219,6 +232,7 @@ class MainActivity : AppCompatActivity() {
         voisins.clear()
         noms.clear()
         demandesEnCours.clear()
+        envoyesA.clear()
         reseauActif = false
         boutonDemarrer.text = "Démarrer le réseau"
         majStatut()
@@ -260,6 +274,8 @@ class MainActivity : AppCompatActivity() {
             if (resultat.status.isSuccess) {
                 voisins[id] = noms[id] ?: id
                 ecrire("Connecté à ${voisins[id]}")
+                // Store-and-forward : on donne au nouveau voisin ce qu'on a en mémoire
+                envoyerMemoireA(id)
             } else {
                 ecrire("Connexion échouée (code ${resultat.status.statusCode})")
             }
@@ -270,18 +286,53 @@ class MainActivity : AppCompatActivity() {
             ecrire("${voisins[id] ?: id} s'est déconnecté (hors de portée ?)")
             voisins.remove(id)
             noms.remove(id)
+            envoyesA.remove(id)
             demandesEnCours.remove(id)
             majStatut()
             relancerRecherche()
         }
     }
 
-    // Réception des messages
+    // ------------------------------------------------------------------
+    // Réception et relais des messages
+    // ------------------------------------------------------------------
     private val receptionMessages = object : PayloadCallback() {
         override fun onPayloadReceived(id: String, payload: Payload) {
-            if (payload.type == Payload.Type.BYTES) {
-                val texte = String(payload.asBytes() ?: return, Charsets.UTF_8)
-                ecrire("${voisins[id] ?: id} : $texte")
+            if (payload.type != Payload.Type.BYTES) return
+            val brut = String(payload.asBytes() ?: return, Charsets.UTF_8)
+
+            // Message "simple" (par exemple un ping) : on l'affiche, sans le relayer
+            val env: JSONObject = try {
+                JSONObject(brut)
+            } catch (e: Exception) {
+                ecrire("${voisins[id] ?: id} : $brut")
+                return
+            }
+            val idMsg = env.optString("id", "")
+            if (idMsg.isEmpty()) {
+                ecrire("${voisins[id] ?: id} : $brut")
+                return
+            }
+
+            // Anti-doublon : on ne traite jamais deux fois le même message
+            if (vus.contains(idMsg)) return
+            vus.add(idMsg)
+            marquerEnvoye(id, idMsg)   // inutile de le renvoyer à celui qui vient de nous le donner
+
+            val de = env.optString("de", "?")
+            val sauts = env.optInt("sauts", 0)
+            val ttl = env.optInt("ttl", 0)
+            val texte = env.optString("texte", "")
+            ecrire("$de : $texte  ($sauts saut(s), via ${voisins[id] ?: id})")
+
+            // Relais : on garde le message et on le passe aux autres voisins
+            if (ttl > 0) {
+                val suite = JSONObject(env.toString())
+                suite.put("ttl", ttl - 1)
+                suite.put("sauts", sauts + 1)
+                memoire[idMsg] = Stocke(suite, System.currentTimeMillis())
+                transmettre(suite, id)
+                majStatut()
             }
         }
 
@@ -290,7 +341,75 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Relance la recherche : sert à se reconnecter quand on revient à portée
+    private fun dejaEnvoye(idVoisin: String, idMsg: String): Boolean =
+        envoyesA[idVoisin]?.contains(idMsg) == true
+
+    private fun marquerEnvoye(idVoisin: String, idMsg: String) {
+        envoyesA.getOrPut(idVoisin) { mutableSetOf() }.add(idMsg)
+    }
+
+    // Envoie un message à tous les voisins qui ne l'ont pas encore (sauf celui indiqué)
+    private fun transmettre(env: JSONObject, sauf: String?) {
+        val idMsg = env.getString("id")
+        val cibles = voisins.keys.filter { it != sauf && !dejaEnvoye(it, idMsg) }
+        if (cibles.isEmpty()) return
+        cibles.forEach { marquerEnvoye(it, idMsg) }
+        client.sendPayload(cibles, Payload.fromBytes(env.toString().toByteArray(Charsets.UTF_8)))
+        ecrire("   > transmis à ${cibles.size} téléphone(s)")
+    }
+
+    // Donne à un nouveau voisin tous les messages gardés en mémoire
+    private fun envoyerMemoireA(idVoisin: String) {
+        purgerMemoire()
+        var nombre = 0
+        for (stocke in memoire.values) {
+            val idMsg = stocke.env.getString("id")
+            if (!dejaEnvoye(idVoisin, idMsg)) {
+                marquerEnvoye(idVoisin, idMsg)
+                client.sendPayload(
+                    idVoisin,
+                    Payload.fromBytes(stocke.env.toString().toByteArray(Charsets.UTF_8))
+                )
+                nombre++
+            }
+        }
+        if (nombre > 0) {
+            ecrire("   > $nombre message(s) en mémoire donné(s) à ${voisins[idVoisin] ?: idVoisin}")
+        }
+    }
+
+    private fun purgerMemoire() {
+        val limite = System.currentTimeMillis() - DUREE_MEMOIRE_MS
+        memoire.values.removeAll { it.recuLe < limite }
+    }
+
+    private fun envoyer() {
+        val texte = champMessage.text.toString().trim()
+        if (texte.isEmpty()) return
+
+        val env = JSONObject()
+        val idMsg = UUID.randomUUID().toString()
+        env.put("id", idMsg)
+        env.put("de", monNom)
+        env.put("ttl", TTL_DEPART)
+        env.put("sauts", 0)
+        env.put("texte", texte)
+
+        vus.add(idMsg)
+        memoire[idMsg] = Stocke(env, System.currentTimeMillis())
+        ecrire("Moi : $texte")
+        if (voisins.isEmpty()) {
+            ecrire("   (gardé en mémoire : sera donné au prochain téléphone croisé)")
+        } else {
+            transmettre(env, null)
+        }
+        majStatut()
+        champMessage.setText("")
+    }
+
+    // ------------------------------------------------------------------
+    // Reconnexion et test de portée
+    // ------------------------------------------------------------------
     private fun relancerRecherche() {
         if (!reseauActif) return
         client.stopDiscovery()
@@ -308,7 +427,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Test de portée : un "ping" toutes les 2 secondes
+    // Test de portée : un "ping" toutes les 2 secondes (non relayé)
     private val boucleDuPing = object : Runnable {
         override fun run() {
             if (!pingActif) return
@@ -332,14 +451,6 @@ class MainActivity : AppCompatActivity() {
             boutonPing.text = "Test de portée (ping)"
             rythme.removeCallbacks(boucleDuPing)
         }
-    }
-
-    private fun envoyer() {
-        val texte = champMessage.text.toString().trim()
-        if (texte.isEmpty() || voisins.isEmpty()) return
-        client.sendPayload(voisins.keys.toList(), Payload.fromBytes(texte.toByteArray(Charsets.UTF_8)))
-        ecrire("Moi : $texte")
-        champMessage.setText("")
     }
 
     override fun onDestroy() {
